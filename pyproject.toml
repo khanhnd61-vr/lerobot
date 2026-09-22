@@ -243,6 +243,8 @@ fastwam = [
     "lerobot[diffusers-dep]",
 ]
 evo1 = ["lerobot[transformers-dep]"]
+# The frozen T5-small text tower and its sentencepiece tokenizer come from transformers.
+impact = ["lerobot[transformers-dep]", "sentencepiece>=0.2.0,<0.3.0"]
 hilserl = ["lerobot[transformers-dep]", "lerobot[dataset]", "gym-hil>=0.1.14,<0.2.0", "lerobot[grpcio-dep]", "lerobot[placo-dep]"]
 vla_jepa = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[qwen-vl-utils-dep]"]
 lingbot_va = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[accelerate-dep]"]
@@ -328,6 +330,7 @@ all = [
     "lerobot[groot]",
     "lerobot[xvla]",
     "lerobot[evo1]",
+    "lerobot[impact]",
     "lerobot[hilserl]",
     "lerobot[vla_jepa]",
     "lerobot[lingbot_va]",
@@ -367,6 +370,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-vla-simd="lerobot.scripts.lerobot_vla_simd:main"
 
 # ---------------- Tool Configurations ----------------
 

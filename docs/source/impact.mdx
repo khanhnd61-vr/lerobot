@@ -1,0 +1,197 @@
+# IMPACT: Instruction-Modulated Perception + ACTion chunking
+
+## Overview
+
+ACT is the cheapest policy in LeRobot to run on a CPU, and it has no language tower — one
+checkpoint per task, and no way to retask it without retraining. **IMPACT** spends a small
+part of that latency headroom on language: two camera frames, a joint state and a natural
+language instruction go in, and a 50-step action chunk comes out in one forward pass.
+
+```
+"pick up the black bowl"
+      │
+  T5-small encoder (frozen) ──> (B, L, 512)
+      │
+      ├─> masked mean-pool ──> FiLM head ──> (γ, β) per ResNet stage ──┐
+      └─> text projection ──> L tokens appended to the encoder seq ─┐  │
+                                                                    │  │
+front ──┐                                                           │  │
+        ├─> ResNet-18 + FiLM <─────────────────────────────────────────┘
+wrist ──┘        │                                                  │
+                 v                                                  v
+   encoder sequence [latent | state | cam0 | cam1 | text] + key-padding mask
+                 │
+       6 × encoder layer ──> 4 × decoder layer, 50 queries ──> (B, 50, action_dim)
+```
+
+Everything not concerned with language is ACT unchanged, including the CVAE style encoder
+that collapses to a constant token at inference. The encoder and decoder layer blocks are
+ACT's own classes, so a backbone or transformer tensor is interchangeable between the two.
+
+## The instruction enters twice, on purpose
+
+**As tokens** in the transformer encoder sequence. The decoder reads them for free, because
+it already cross-attends the whole encoder memory.
+
+**As FiLM** on the ResNet stages — `(1 + γ) ⊙ x + β` per channel, computed from the pooled
+instruction.
+
+The second path is the one that matters. With ~600 visual tokens beside ~32 text tokens,
+and manipulation scenes whose visible objects usually disambiguate the task, a policy will
+happily learn to ignore the instruction: text tokens are a channel the gradient _may_ use
+and never has to. FiLM puts language inside the perceptual path, where routing around it is
+not an option.
+
+`policy.use_film=false` gives the ablation that asks whether that was necessary, and
+`policy.language_dropout=1.0` the always-blind arm.
+
+## Configuration deltas from ACT
+
+|                    | ACT | IMPACT                           |
+| ------------------ | --- | -------------------------------- |
+| `chunk_size`       | 100 | **50**                           |
+| `n_encoder_layers` | 4   | **6**                            |
+| `n_decoder_layers` | 1   | **4**                            |
+| language           | —   | frozen T5-small, 32 tokens, FiLM |
+| trainable params   | 34M | **~78M**                         |
+
+`chunk_size` is halved because the point of a policy you can talk to is that you can retask
+it, and at 30 Hz a 100-step chunk means a new instruction takes up to 3.33 s to take effect.
+50 halves that and costs almost nothing: chunk length only touches the decoder's query
+count.
+
+`n_encoder_layers` and `n_decoder_layers` go up because ACT's depths were sized for a task
+with no language in it — the encoder is where vision and language fuse, and a single decoder
+layer is very shallow for reading a fused multimodal memory.
+
+The text tower is frozen, so its weights are never written into a checkpoint; they are
+reloaded from the Hub (`google-t5/t5-small`) on every instantiation.
+
+## Installation
+
+```bash
+pip install -e ".[impact]"
+```
+
+## Training
+
+IMPACT needs a dataset whose episodes carry instructions — the task string is tokenized by
+the processor pipeline and is not optional.
+
+```bash
+lerobot-train \
+  --dataset.repo_id=YOUR_DATASET \
+  --policy.type=impact \
+  --policy.repo_id=HF_USER/impact-your-robot \
+  --output_dir=./outputs/impact_training \
+  --job_name=impact_training \
+  --policy.device=cuda \
+  --steps=20000
+```
+
+To run the ablations:
+
+```bash
+# no FiLM: language only reaches the model as encoder tokens
+lerobot-train ... --policy.use_film=false
+
+# always blind: the instruction is dropped from both paths every step
+lerobot-train ... --policy.language_dropout=1.0
+```
+
+<Tip warning={true}>
+
+A language-conditioned policy is only distinguishable from a language-shaped ornament if
+the evaluation split contains tasks that **share a scene and differ only by the
+instruction**. Without that split, a high success rate says nothing about whether the
+policy reads the instruction at all.
+
+</Tip>
+
+## Quantization-aware training
+
+`policy.int8_groups` runs selected GEMM groups through a simulated W8A8 kernel — during
+training, which makes it quantization-aware training, and at inference. The mask is a
+6-bit field:
+
+| Bit | Group               |
+| --- | ------------------- |
+| 1   | encoder attention   |
+| 2   | encoder w1          |
+| 4   | encoder w2          |
+| 8   | token projections   |
+| 16  | decoder             |
+| 32  | ResNet convolutions |
+
+`63` selects all of them; `0`, the default, is the ordinary fp32 policy and costs nothing.
+
+```bash
+lerobot-train ... --policy.int8_groups=63 --policy.int8_conv_clip=0.9
+```
+
+Two properties are worth knowing before using it:
+
+- **A QAT checkpoint carries no quantization state.** Every scale is dynamic — per output
+  row for weights, per token (per image for a convolution) for activations — so the result
+  is an ordinary fp32 checkpoint whose weights happen to survive rounding. It loads and
+  exports through every existing path unchanged, and `--policy.int8_groups=0` recovers the
+  float numerics from the same weights.
+- **BatchNorm is folded before the convolution is quantized**, because an exporter folds
+  too. Quantizing the raw weight would train the model against rounding error it will never
+  meet, and leave it untrained against the error it will.
+
+The quantizer is not a generic utility: it transcribes one specific deployment kernel, down
+to the reciprocal-multiply and the round-to-nearest-even, so that what training optimizes is
+the arithmetic that actually runs on the target. See
+`src/lerobot/policies/impact/quantization.py`.
+
+<Tip warning={true}>
+
+The int8 path is _simulated_ in PyTorch. It reproduces the deployment arithmetic; it does
+not make anything faster here.
+
+</Tip>
+
+## Deployment
+
+IMPACT is designed to be served over the [async inference](./async) protocol, which means
+the policy can run on a different machine from the robot. `lerobot-vla-simd` is the
+robot-side entry point for a CPU inference engine that speaks that protocol:
+
+```bash
+lerobot-vla-simd \
+  --server_address=127.0.0.1:8080 \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.id=my_arm \
+  --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, \
+                     wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}" \
+  --task="pick up the tape" \
+  --actions_per_chunk=50
+```
+
+It also has a hardware-free mode that replays recorded frames at a server and reports the
+round-trip latency next to the actions it returns, which answers "is the server up, serving
+the model I think, and producing sane actions" before a robot is wired to it:
+
+```bash
+lerobot-vla-simd --server_address=127.0.0.1:8080 --replay.repo_id=<user>/<dataset>
+```
+
+## Four things that are easy to get wrong
+
+Each is pinned by a test in `tests/policies/impact/`, and each is a mistake that trains,
+runs, and produces plausible actions.
+
+1. **`(1 + γ) ⊙ x + β`, not `γ ⊙ x + β`.** The FiLM head is zero-initialized, so the `1 +`
+   makes it exactly the identity at init and training starts from ordinary ACT. Written as
+   a plain product, a zero-init head annihilates the feature map and nothing recovers.
+2. **The text tower must see the real padding mask.** T5 is bidirectional: let it attend
+   over padded positions and the _real_ tokens' hidden states already carry whatever the
+   tokenizer padded with. No downstream mask repairs that. The symptom is that the same
+   instruction gives different actions in a differently-padded batch.
+3. **The padded rows are masked as keys in two places** — the encoder self-attention and
+   the decoder's cross-attention over the memory. They hold genuine T5 outputs, not zeros.
+4. **The CVAE style encoder should see the instruction** (`vae_sees_language=true`).
+   Otherwise the latent absorbs task identity in training and the language pathway becomes
+   redundant — a failure invisible at inference, where the latent is zero.

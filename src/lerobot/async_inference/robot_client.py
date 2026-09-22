@@ -88,6 +88,7 @@ from .helpers import (
     TimedAction,
     TimedObservation,
     get_logger,
+    loads_action_chunk,
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
@@ -296,7 +297,7 @@ class RobotClient:
 
                 # Deserialize bytes back into list[TimedAction]
                 deserialize_start = time.perf_counter()
-                timed_actions = pickle.loads(actions_chunk.data)  # nosec
+                timed_actions = loads_action_chunk(actions_chunk.data)
                 deserialize_time = time.perf_counter() - deserialize_start
 
                 # Log device type of received actions

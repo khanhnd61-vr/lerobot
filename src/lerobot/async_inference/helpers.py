@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import logging
 import logging.handlers
 import os
+import pickle  # nosec
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -296,3 +298,45 @@ def observations_similar(
     )
 
     return _compare_observation_states(obs1_state, obs2_state, atol=atol)
+
+
+# The wire dataclasses, by name. A policy server that does not import lerobot has to
+# define its own copies, and pickle then stamps the payload with *that* module, so the
+# names are all the client has to go on. See `loads_action_chunk`.
+_WIRE_CLASSES = {
+    "TimedAction": TimedAction,
+    "TimedObservation": TimedObservation,
+}
+
+
+class _WireUnpickler(pickle.Unpickler):
+    """Unpickler that also accepts wire dataclasses defined outside lerobot.
+
+    Only globals pickle cannot resolve on its own are remapped, so a payload from
+    lerobot's own policy server is unpickled exactly as before.
+    """
+
+    def find_class(self, module: str, name: str):
+        try:
+            return super().find_class(module, name)
+        except (ImportError, AttributeError):
+            cls = _WIRE_CLASSES.get(name)
+            if cls is None:
+                raise
+            return cls
+
+
+def loads_action_chunk(data: bytes) -> list[TimedAction]:
+    """Deserialize a `GetActions` payload into a `list[TimedAction]`.
+
+    The payload is a pickled `list[TimedAction]`, but a server that keeps lerobot (and
+    torch) off its own machine -- a CPU inference engine written in C++, for instance --
+    defines the dataclass itself and sends `__main__.TimedAction` holding a numpy action.
+    Mapping the class back here and tensorizing the action means the rest of the client
+    sees the same objects it gets from lerobot's own server.
+    """
+    timed_actions: list[TimedAction] = _WireUnpickler(io.BytesIO(data)).load()  # nosec
+    for timed_action in timed_actions:
+        if not isinstance(timed_action.action, torch.Tensor):
+            timed_action.action = torch.as_tensor(timed_action.action)
+    return timed_actions

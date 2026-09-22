@@ -55,6 +55,8 @@
 - sections:
   - local: act
     title: ACT
+  - local: impact
+    title: IMPACT
   - local: smolvla
     title: SmolVLA
   - local: pi0
