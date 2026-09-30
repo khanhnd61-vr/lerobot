@@ -245,6 +245,9 @@ fastwam = [
 evo1 = ["lerobot[transformers-dep]"]
 # The frozen T5-small text tower and its sentencepiece tokenizer come from transformers.
 impact = ["lerobot[transformers-dep]", "sentencepiece>=0.2.0,<0.3.0"]
+# Client for a vla.cpp inference server: ZeroMQ transport, protobuf schema, and the
+# tokenizers each served architecture was trained against.
+vla-cpp = ["pyzmq>=26.0.0,<28.0.0", "lerobot[grpcio-dep]", "lerobot[transformers-dep]", "sentencepiece>=0.2.0,<0.3.0"]
 hilserl = ["lerobot[transformers-dep]", "lerobot[dataset]", "gym-hil>=0.1.14,<0.2.0", "lerobot[grpcio-dep]", "lerobot[placo-dep]"]
 vla_jepa = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[qwen-vl-utils-dep]"]
 lingbot_va = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[accelerate-dep]"]
@@ -331,6 +334,7 @@ all = [
     "lerobot[xvla]",
     "lerobot[evo1]",
     "lerobot[impact]",
+    "lerobot[vla-cpp]",
     "lerobot[hilserl]",
     "lerobot[vla_jepa]",
     "lerobot[lingbot_va]",
@@ -371,6 +375,7 @@ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-vla-simd="lerobot.scripts.lerobot_vla_simd:main"
+lerobot-vla-cpp="lerobot.scripts.lerobot_vla_cpp:main"
 
 # ---------------- Tool Configurations ----------------
 
@@ -388,7 +393,7 @@ torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 
 [tool.setuptools.package-data]
-lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]
+lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt", "vla_cpp/*.proto"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
