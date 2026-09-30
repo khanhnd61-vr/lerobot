@@ -14,10 +14,15 @@
 
 """Drive a robot against a policy served by a `vla.cpp` inference server.
 
-`vla-server` runs one GGUF checkpoint on the CPU (or CUDA, Metal, SYCL, OpenVINO,
-OpenCL, Hexagon) and answers ZeroMQ REQ/REP requests carrying protobuf. That is a
-different wire format from lerobot's own gRPC async-inference protocol, so this is a
-separate command from `lerobot-vla-simd` rather than a flag on it.
+`vla-server` runs one GGUF checkpoint on whichever backend it was built for - CUDA,
+Metal, SYCL, OpenVINO, OpenCL, Hexagon or CPU - and answers ZeroMQ REQ/REP requests
+carrying protobuf. That is a different wire format from lerobot's own gRPC
+async-inference protocol, so this is a separate command from `lerobot-vla-simd`
+rather than a flag on it.
+
+The backend is the engine's business, not this client's, but it decides whether the
+policy keeps up: SmolVLA is ~125 ms per query on an RTX 3060 against ~1.7 s on a
+desktop CPU, and a 50-step chunk is only 1.67 s of motion at 30 fps. Prefer a GPU.
 
 The loop here is **synchronous**, because the server is: one request, one reply, no
 background receiver. A chunk is executed `n_action_steps` deep before the next
