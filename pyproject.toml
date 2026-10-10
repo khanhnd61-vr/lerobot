@@ -355,6 +355,7 @@ all = [
 ]
 
 [project.scripts]
+lerobot-r3m-rollout="lerobot.r3m_groot.rollout:main"
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
 lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"

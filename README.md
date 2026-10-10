@@ -8,6 +8,11 @@ Everything upstream works as documented upstream. This covers only what is diffe
 
 ## What this fork adds
 
+**[R3M / VIGIL / SigLIP-2 / VC-1 + GR00T action-head rollout](examples/r3m_groot/)**:
+load the existing SO-101 `.pt` checkpoints, replay cached episodes, and run the arm
+with measured-position motion limits. This uses a separate deployment environment;
+see that guide for setup and commands.
+
 |                                            |                                                                                                                                                                                      |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **[IMPACT](src/lerobot/policies/impact/)** | ACT with a frozen T5-small language tower - the instruction enters as encoder tokens _and_ as FiLM on the ResNet stages. [Details](docs/source/impact.mdx)                           |

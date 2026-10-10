@@ -1,0 +1,26 @@
+# Dedicated deployment environment, Python 3.12. No full LeRobot/GR00T training extras.
+# GR00T N1.7 needs transformers 4.x + Hub 0.x; this fork's general training
+# environment uses transformers 5.x + Hub 1.x. Keep this runtime separate.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+transformers==4.57.3
+diffusers==0.35.1
+numpy==1.26.4
+timm
+hydra-core
+gdown
+opencv-python-headless
+dm-tree
+tyro
+einops
+peft
+albumentations
+pandas
+pyarrow
+av
+draccus==0.11.6
+pyserial
+feetech-servo-sdk
+deepdiff
+termcolor
