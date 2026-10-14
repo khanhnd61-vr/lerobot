@@ -22,6 +22,7 @@ engine agrees, which needs the engine.
 """
 
 import threading
+import time
 import uuid
 
 import numpy as np
@@ -40,8 +41,9 @@ CHUNK_SIZE, ACTION_DIM = 4, 7
 class FakeServer:
     """A REP socket that answers with a canned chunk and records what it was sent."""
 
-    def __init__(self, chunk: np.ndarray | None = None, error: str = ""):
+    def __init__(self, chunk: np.ndarray | None = None, error: str = "", delay_s: float = 0.0):
         self.address = f"inproc://vla-cpp-test-{uuid.uuid4().hex}"
+        self.delay_s = delay_s
         self.chunk = (
             chunk
             if chunk is not None
@@ -65,6 +67,8 @@ class FakeServer:
             request = vla_pb2.PredictRequest()
             request.ParseFromString(self._sock.recv())
             self.requests.append(request)
+            if self.delay_s:
+                time.sleep(self.delay_s)
             response = vla_pb2.PredictResponse(request_id=request.request_id)
             if self.error:
                 response.error = self.error

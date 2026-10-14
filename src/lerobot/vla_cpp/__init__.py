@@ -25,12 +25,16 @@ python -m grpc_tools.protoc -I src/lerobot/vla_cpp \
 """
 
 from .archs import ARCH_PRESETS
+from .async_client import AGGREGATE_FUNCTIONS, AsyncVlaCppClient, TimedActionQueue
 from .client import DEFAULT_ADDRESS, VlaCppClient, VlaCppError
 from .stats import build_gr00t_normalizers, pi05_state_quantiles
 
 __all__ = [
+    "AGGREGATE_FUNCTIONS",
     "ARCH_PRESETS",
+    "AsyncVlaCppClient",
     "DEFAULT_ADDRESS",
+    "TimedActionQueue",
     "VlaCppClient",
     "VlaCppError",
     "build_gr00t_normalizers",

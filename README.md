@@ -12,7 +12,7 @@ Everything upstream works as documented upstream. This covers only what is diffe
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **[IMPACT](src/lerobot/policies/impact/)** | ACT with a frozen T5-small language tower - the instruction enters as encoder tokens _and_ as FiLM on the ResNet stages. [Details](docs/source/impact.mdx)                           |
 | **IMPACT int8 / QAT**                      | `--policy.int8_groups` runs selected GEMMs through a simulated W8A8 kernel, in training and at inference. A QAT checkpoint is an ordinary fp32 checkpoint.                           |
-| **`lerobot-vla-cpp`**                      | Client for a [`vla.cpp`](https://github.com/VinRobotics/vla.cpp) server (ZeroMQ + protobuf). Does the per-arch preprocessing, so it covers SmolVLA, π0, π0.5 and GR00T N1.5/1.6/1.7. |
+| **`lerobot-vla-cpp`**                      | Client for a [`vla.cpp`](https://github.com/VinRobotics/vla.cpp) server (ZeroMQ + protobuf). Does the per-arch preprocessing, so it covers SmolVLA, π0, π0.5 and GR00T N1.5/1.6/1.7; `--mode=async` fills a timestep-aligned action queue from a worker thread. |
 | **`lerobot-vla-simd`**                     | Client for a [`vla.simd`](https://github.com/cair-vinuni/vla.simd) server, over lerobot's own async-inference protocol.                                                              |
 | **`loads_action_chunk`**                   | Lets the async client read chunks from a server that keeps lerobot and torch off its own machine.                                                                                    |
 
@@ -176,10 +176,29 @@ loads, runs and returns plausible actions. Choices: `smolvla`, `pi0`, `pi05`,
 `--stats_json` is required for `pi05` and the GR00T archs; GR00T also takes `--embodiment`,
 and `--rel_stats_json` for an N1.7 checkpoint trained with relative actions.
 
-<!-- prettier-ignore -->
-> **Async inference is not supported yet.** `vla-server` answers one request at a time, so
-> the loop is synchronous and `--n_action_steps` is exactly the feedback rate - 25 at 30 fps
-> leaves ~0.83 s between observations.
+**Two control loops.** The default `--mode=sync` is one request, one reply: `--n_action_steps`
+of each chunk are executed before the next request, so that number is exactly the feedback
+rate (25 at 30 fps leaves ~0.83 s between observations), and the arm pauses for one round
+trip per chunk. `--mode=async` runs the round trip on a worker thread and keeps the same
+timestep-aligned action queue as `lerobot-vla-simd`: the next observation goes out once the
+queue drains to `actions_per_chunk × chunk_size_threshold`, and when its chunk lands the
+steps that elapsed meanwhile are dropped, overlapping actions are blended with
+`--aggregate_fn_name`, and the rest are appended. The arm never waits for the server, and the
+[queue sizing](#sizing-the-queue) rules below apply as they are.
+
+```bash
+lerobot-vla-cpp --mode=async --server_address=tcp://127.0.0.1:5555 --arch=smolvla "${ROBOT[@]}" \
+  --task="Put the tape into the box" --actions_per_chunk=50 --chunk_size_threshold=0.5 \
+  --aggregate_fn_name=latest_only --fps=30 --duration=60
+```
+
+Only one request is in flight at a time (the client socket is REQ), so the observation the
+model sees is the one captured the tick the previous reply came back. On the server side
+`vla-server --queue latest` keeps one pending request per client and answers a stale one
+with `error="superseded"`, which matters when several robots share a server; a lone client
+never triggers it. Each query logs the round trip, how many steps elapsed during it and
+what the merge dropped, blended and appended; a run that prints `action queue empty` needs
+a higher `--chunk_size_threshold` or a faster host.
 
 ### Through a `vla.simd` server
 

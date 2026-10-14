@@ -95,6 +95,45 @@ def test_config_rejects_a_zero_chunk_depth():
         _cli().VlaCppClientConfig(n_action_steps=0)
 
 
+def test_config_accepts_both_inference_modes():
+    cli = _cli()
+    assert cli.VlaCppClientConfig(mode="sync").mode == "sync"
+    assert cli.VlaCppClientConfig(mode="async").mode == "async"
+
+
+def test_config_rejects_an_unknown_mode():
+    with pytest.raises(ValueError, match="mode"):
+        _cli().VlaCppClientConfig(mode="rtc")
+
+
+def test_config_validates_the_async_queue_parameters():
+    cli = _cli()
+    with pytest.raises(ValueError, match="actions_per_chunk"):
+        cli.VlaCppClientConfig(actions_per_chunk=0)
+    with pytest.raises(ValueError, match="chunk_size_threshold"):
+        cli.VlaCppClientConfig(chunk_size_threshold=1.5)
+    with pytest.raises(ValueError, match="aggregate_fn_name"):
+        cli.VlaCppClientConfig(aggregate_fn_name="median")
+
+
+def test_build_async_client_reads_the_config():
+    from lerobot.vla_cpp.async_client import AGGREGATE_FUNCTIONS
+
+    cli = _cli()
+    cfg = cli.VlaCppClientConfig(
+        mode="async", actions_per_chunk=20, chunk_size_threshold=0.25, aggregate_fn_name="latest_only", fps=20
+    )
+
+    class StubClient:
+        action_dim = 6
+
+    engine = cli.build_async_client(cfg, StubClient())
+    assert engine.actions_per_chunk == 20
+    assert engine.chunk_size_threshold == 0.25
+    assert engine.aggregate_fn is AGGREGATE_FUNCTIONS["latest_only"]
+    assert engine.dt == pytest.approx(0.05)
+
+
 # ---------------------------------------------------------------------------
 # The GR00T state split - an assumption, so it is pinned
 # ---------------------------------------------------------------------------
