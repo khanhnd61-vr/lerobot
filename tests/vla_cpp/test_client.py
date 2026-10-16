@@ -352,6 +352,24 @@ def test_smolvla_resizes_to_the_preset(server, stub_tokenizer):
     assert (server.last.images[0].height, server.last.images[0].width) == (512, 512)
 
 
+def test_act_sends_native_frames_raw_state_and_no_tokens(server):
+    """ACT has no language input and its engine normalizes with the checkpoint's stats."""
+    client = VlaCppClient(
+        server.address, arch="act", image_keys=("observation.images.cam0",), recv_timeout_ms=4000
+    )
+    with client:
+        client.predict_chunk(
+            {
+                "observation.images.cam0": np.zeros((3, 480, 640), dtype=np.float32),
+                OBS_STATE: np.array([1, 2, 3, 4, 5, 6], dtype=np.float32),
+                "task": "ignored",
+            }
+        )
+    assert (server.last.images[0].height, server.last.images[0].width) == (480, 640)
+    assert list(server.last.state) == [1, 2, 3, 4, 5, 6]
+    assert len(server.last.lang_tokens) == 0
+
+
 def test_pi05_sends_a_zero_state_and_digitizes_it_into_the_prompt(server, stub_tokenizer, tmp_path):
     """pi0.5 reads the state from the text, so the float field is deliberately zeros.
 

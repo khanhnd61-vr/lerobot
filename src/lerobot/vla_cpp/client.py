@@ -122,6 +122,7 @@ class VlaCppClient:
                 sends them at their native resolution.
             max_state_dim (`int`, *optional*):
                 Width the state vector is zero-padded to, overriding the preset.
+                A preset of `None` (ACT) sends the state at its own width.
             max_length (`int`, *optional*):
                 Token budget for the prompt, overriding the preset.
             image_keys (`tuple[str, ...]`, *optional*, defaults to front and wrist):
@@ -155,7 +156,7 @@ class VlaCppClient:
         preset = resolve_preset(arch)
         self.arch = arch
         self.image_size = image_size if image_size is not None else preset["image_size"]
-        self.max_state_dim = max_state_dim if max_state_dim is not None else preset.get("max_state_dim", 32)
+        self.max_state_dim = max_state_dim if max_state_dim is not None else preset.get("max_state_dim")
         self.max_length = max_length if max_length is not None else preset.get("max_length", 48)
         self.image_keys = tuple(image_keys)
         self.action_dim = action_dim
@@ -219,7 +220,7 @@ class VlaCppClient:
     def _load_tokenizer(arch: str, tokenizer: str | None, preset: dict[str, Any]):
         name = tokenizer if tokenizer is not None else preset["tokenizer"]
         if name is None:
-            if arch == "passthrough":
+            if arch in ("passthrough", "act"):
                 return None
             raise ValueError(
                 f"arch={arch} has no default tokenizer; pass one (an HF id or a local checkpoint directory)."
@@ -371,6 +372,8 @@ class VlaCppClient:
         return _as_numpy(observation[OBS_STATE]).astype(np.float32).reshape(-1)
 
     def _padded_state(self, state: np.ndarray) -> np.ndarray:
+        if self.max_state_dim is None:
+            return state
         if state.size > self.max_state_dim:
             raise ValueError(
                 f"state is {state.size}-D but arch={self.arch} sends "
@@ -404,7 +407,7 @@ class VlaCppClient:
     # -- per-arch paths -----------------------------------------------------
 
     def _predict_generic(self, observation: dict[str, Any]) -> np.ndarray:
-        """SmolVLA, pi0 and passthrough: frames, flat padded state, tokenized task.
+        """SmolVLA, pi0, ACT and passthrough: frames, flat padded state, tokenized task.
 
         The trailing newline on the task is not cosmetic - the checkpoints were
         trained on prompts that carry it, and dropping it shifts every token id

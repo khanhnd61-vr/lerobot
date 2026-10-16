@@ -64,6 +64,14 @@ ARCH_PRESETS: dict[str, dict[str, Any]] = {
         "tokenizer": "nvidia/Cosmos-Reason2-2B",
         "max_state_dim": 132,
     },
+    "act": {
+        # ACT has no language input and its ResNet runs at the camera's own
+        # resolution. The engine normalizes with the checkpoint's statistics, so
+        # the raw joint state goes out unpadded (None: the robot's own width).
+        "image_size": None,
+        "tokenizer": None,
+        "max_state_dim": None,
+    },
     "passthrough": {
         # Whatever the frames already are. resize_with_pad is skipped entirely,
         # so the server receives the robot's native resolution.
