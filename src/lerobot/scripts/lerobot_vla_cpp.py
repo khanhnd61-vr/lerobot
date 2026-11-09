@@ -24,9 +24,15 @@ The backend is the engine's business, not this client's, but it decides whether 
 policy keeps up: SmolVLA is ~125 ms per query on an RTX 3060 against ~1.7 s on a
 desktop CPU, and a 50-step chunk is only 1.67 s of motion at 30 fps. Prefer a GPU.
 
-The loop here is **synchronous**, because the server is: one request, one reply, no
-background receiver. A chunk is executed `n_action_steps` deep before the next
-request goes out, so that number is the feedback rate.
+Two control loops are offered. `--mode=sync` (the default) is one request, one
+reply: a chunk is executed `n_action_steps` deep before the next request goes out,
+so that number is the feedback rate, and the arm pauses for one round trip per
+chunk. `--mode=async` runs the round trip on a worker thread and keeps a
+timestep-aligned action queue, the scheme of lerobot's own async-inference client:
+once the queue drains to `actions_per_chunk * chunk_size_threshold` the next
+observation goes out, and when its chunk arrives the steps that elapsed meanwhile
+are dropped, overlapping actions are blended with `--aggregate_fn_name`, and the rest
+are appended. The arm never waits for the server.
 
 Drive a robot (the server is already running elsewhere):
 
@@ -41,6 +47,12 @@ lerobot-vla-cpp \
                        wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}" \
     --task="pick up the tape" \
     --n_action_steps=25
+```
+
+The same, without pausing the arm while the server thinks:
+
+```shell
+lerobot-vla-cpp --mode=async --chunk_size_threshold=0.5 --aggregate_fn_name=latest_only ...
 ```
 
 Check a server with no robot attached, replaying recorded frames instead:
@@ -94,6 +106,9 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
 from lerobot.vla_cpp import ARCH_PRESETS, DEFAULT_ADDRESS, VlaCppClient
 from lerobot.vla_cpp.archs import MODALITY_KEYED_ARCHS
+from lerobot.vla_cpp.async_client import AGGREGATE_FUNCTIONS, AsyncVlaCppClient
+
+INFERENCE_MODES = ("sync", "async")
 
 
 @dataclass
@@ -154,6 +169,33 @@ class VlaCppClientConfig:
         metadata={"help": "Action columns to execute. 0 means the robot's joint count."},
     )
 
+    # Asynchronous inference. Ignored in sync mode.
+    mode: str = field(
+        default="sync",
+        metadata={
+            "help": "'sync' queries inline and pauses the arm for the round trip; 'async' "
+            "queries on a worker thread and merges chunks into a timestep-aligned queue."
+        },
+    )
+    actions_per_chunk: int = field(
+        default=50,
+        metadata={"help": "Async: steps of each chunk to keep. The chunk is truncated to this."},
+    )
+    chunk_size_threshold: float = field(
+        default=0.5,
+        metadata={
+            "help": "Async: send the next observation once the queue is at or below this "
+            "fraction of actions_per_chunk. Must exceed latency * fps / actions_per_chunk."
+        },
+    )
+    aggregate_fn_name: str = field(
+        default="weighted_average",
+        metadata={
+            "help": f"Async: how actions two chunks both cover are blended. "
+            f"Options: {sorted(AGGREGATE_FUNCTIONS)}"
+        },
+    )
+
     # Preprocessing overrides; each defaults to the arch preset.
     tokenizer: str | None = field(default=None, metadata={"help": "Hub id or local processor dir"})
     image_size: int | None = field(default=None, metadata={"help": "Square resize target"})
@@ -186,6 +228,17 @@ class VlaCppClientConfig:
             raise ValueError(f"fps must be positive, got {self.fps}")
         if self.n_action_steps < 1:
             raise ValueError(f"n_action_steps must be >= 1, got {self.n_action_steps}")
+        if self.mode not in INFERENCE_MODES:
+            raise ValueError(f"mode must be one of {INFERENCE_MODES}, got {self.mode!r}")
+        if self.actions_per_chunk < 1:
+            raise ValueError(f"actions_per_chunk must be >= 1, got {self.actions_per_chunk}")
+        if not 0.0 <= self.chunk_size_threshold <= 1.0:
+            raise ValueError(f"chunk_size_threshold must be in [0, 1], got {self.chunk_size_threshold}")
+        if self.aggregate_fn_name not in AGGREGATE_FUNCTIONS:
+            raise ValueError(
+                f"unknown aggregate_fn_name {self.aggregate_fn_name!r}; "
+                f"expected one of {sorted(AGGREGATE_FUNCTIONS)}"
+            )
 
 
 def _camera_keys(robot: Robot) -> list[str]:
@@ -350,8 +403,18 @@ def move_to(robot: Robot, target: dict[str, float], duration_s: float = 3.0, fps
         logging.warning(f"Could not return to the home position: {e}")
 
 
+def build_async_client(cfg: VlaCppClientConfig, client: VlaCppClient) -> AsyncVlaCppClient:
+    return AsyncVlaCppClient(
+        client,
+        actions_per_chunk=cfg.actions_per_chunk,
+        chunk_size_threshold=cfg.chunk_size_threshold,
+        aggregate_fn=cfg.aggregate_fn_name,
+        fps=cfg.fps,
+    )
+
+
 def run_robot(cfg: VlaCppClientConfig) -> None:
-    """Synchronous control loop: observe, query when the queue is dry, act."""
+    """Connect the robot and run the control loop `cfg.mode` asks for."""
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
 
@@ -371,28 +434,12 @@ def run_robot(cfg: VlaCppClientConfig) -> None:
     if home_position:
         logging.info("Home pose on Ctrl+C: %s", {k: round(v, 1) for k, v in home_position.items()})
 
-    period = 1.0 / cfg.fps
-    deadline = time.perf_counter() + cfg.duration
     queries = 0
     try:
-        while time.perf_counter() < deadline:
-            tick = time.perf_counter()
-            raw = robot.get_observation()
-            observation = robot_observation(cfg, client, raw, joint_keys, camera_keys)
-            will_query = client.pending == 0
-            action = client.get_action(observation)
-            if will_query:
-                queries += 1
-                response = client.last_response
-                if response is not None:
-                    logging.info(
-                        "query %d | %.1f ms total, %.1f ms inference",
-                        queries,
-                        response.latency_ms_total,
-                        response.latency_ms_inference,
-                    )
-            robot.send_action({k: float(v) for k, v in zip(joint_keys, action, strict=False)})
-            precise_sleep(max(0.0, period - (time.perf_counter() - tick)))
+        if cfg.mode == "async":
+            queries = _async_loop(cfg, robot, client, joint_keys, camera_keys)
+        else:
+            queries = _sync_loop(cfg, robot, client, joint_keys, camera_keys)
     except KeyboardInterrupt:
         logging.info("Interrupted, shutting down")
     finally:
@@ -402,6 +449,71 @@ def run_robot(cfg: VlaCppClientConfig) -> None:
         client.close()
         robot.disconnect()
         logging.info("Client stopped after %d queries", queries)
+
+
+def _sync_loop(cfg, robot, client: VlaCppClient, joint_keys, camera_keys) -> int:
+    """Observe, query inline when the queue is dry, act. Returns the query count."""
+    period = 1.0 / cfg.fps
+    deadline = time.perf_counter() + cfg.duration
+    queries = 0
+    while time.perf_counter() < deadline:
+        tick = time.perf_counter()
+        raw = robot.get_observation()
+        observation = robot_observation(cfg, client, raw, joint_keys, camera_keys)
+        will_query = client.pending == 0
+        action = client.get_action(observation)
+        if will_query:
+            queries += 1
+            response = client.last_response
+            if response is not None:
+                logging.info(
+                    "query %d | %.1f ms total, %.1f ms inference",
+                    queries,
+                    response.latency_ms_total,
+                    response.latency_ms_inference,
+                )
+        robot.send_action({k: float(v) for k, v in zip(joint_keys, action, strict=False)})
+        precise_sleep(max(0.0, period - (time.perf_counter() - tick)))
+    return queries
+
+
+def _async_loop(cfg, robot, client: VlaCppClient, joint_keys, camera_keys) -> int:
+    """Act from the queue every tick; offer an observation whenever the worker will take one.
+
+    The first ticks starve until the first chunk lands; after that the queue is
+    refilled before it empties as long as `chunk_size_threshold` clears
+    `latency * fps / actions_per_chunk`. A starved tick holds the arm where it is
+    rather than repeating the last action, and is counted so the operator can see it.
+    """
+    period = 1.0 / cfg.fps
+    deadline = time.perf_counter() + cfg.duration
+    starved = 0
+    reported = 0
+    with build_async_client(cfg, client) as engine:
+        while time.perf_counter() < deadline:
+            tick = time.perf_counter()
+            if engine.failed:
+                raise SystemExit(f"inference worker gave up: {engine.failure}")
+
+            action = engine.pop_action()
+            if action is None:
+                starved += 1
+                if starved % cfg.fps == 1:
+                    logging.warning("action queue empty (%d starved ticks so far)", starved)
+            else:
+                robot.send_action({k: float(v) for k, v in zip(joint_keys, action, strict=False)})
+
+            # The observation is read only when it will go out, so a tick that keeps
+            # executing the current chunk costs no camera grab or preprocessing.
+            if engine.ready_to_send():
+                raw = robot.get_observation()
+                engine.offer(robot_observation(cfg, client, raw, joint_keys, camera_keys))
+
+            if engine.queries != reported:
+                reported = engine.queries
+                logging.info("%s | %d starved ticks", engine.last_report, starved)
+            precise_sleep(max(0.0, period - (time.perf_counter() - tick)))
+        return engine.queries
 
 
 def run_replay(cfg: VlaCppClientConfig) -> None:
