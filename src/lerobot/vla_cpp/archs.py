@@ -119,7 +119,7 @@ GR00T_N15_N_TOK_PER_VIEW = 256
 GR00T_DEFAULT_EMBODIMENTS: dict[str, tuple[str, ...]] = {
     "gr00t_n1_5": ("new_embodiment", "libero_sim", "libero_panda"),
     "gr00t_n1_6": ("libero_panda", "libero_sim"),
-    "gr00t_n1_7": ("libero_sim",),
+    "gr00t_n1_7": ("libero_sim", "new_embodiment"),
 }
 
 

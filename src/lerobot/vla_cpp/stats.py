@@ -97,6 +97,8 @@ def pi05_state_quantiles(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     the bins and the digitization would saturate.
     """
     blob = load_stats_blob(path)
+    if "norm_stats" in blob and isinstance(blob["norm_stats"], dict):
+        blob = blob["norm_stats"]
     stats = blob.get("observation.state") or blob.get("state")
     if stats is None:
         raise KeyError(
@@ -111,6 +113,43 @@ def pi05_state_quantiles(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     q01 = np.asarray(stats["q01"], dtype=np.float32).reshape(-1)
     q99 = np.asarray(stats["q99"], dtype=np.float32).reshape(-1)
     return q01, q99
+
+
+def pi05_delta_mask(path: str | Path) -> np.ndarray | None:
+    """Boolean mask of action columns that OpenPI trained as deltas from ``observation.state``.
+
+    OpenPI ``norm_stats.json`` files wrap ``state`` and ``actions`` under ``"norm_stats"``
+    after applying ``DeltaActions(delta_action_mask)``. Columns whose ``actions`` quantiles
+    differ from ``state`` quantiles are delta columns that need ``observation.state`` added
+    back at inference time (`AbsoluteActions`), while columns with identical quantiles (such
+    as the gripper) are already absolute.
+    """
+    blob = load_stats_blob(path)
+    if "delta_action_mask" in blob:
+        return np.asarray(blob["delta_action_mask"], dtype=bool).reshape(-1)
+    if "norm_stats" not in blob or not isinstance(blob["norm_stats"], dict):
+        return None
+    ns = blob["norm_stats"]
+    if "delta_action_mask" in ns:
+        return np.asarray(ns["delta_action_mask"], dtype=bool).reshape(-1)
+    st = ns.get("observation.state") or ns.get("state")
+    ac = ns.get("action") or ns.get("actions")
+    if not isinstance(st, dict) or not isinstance(ac, dict):
+        return None
+    if "q01" not in st or "q99" not in st or "q01" not in ac or "q99" not in ac:
+        return None
+    s_q01 = np.asarray(st["q01"], dtype=np.float32).reshape(-1)
+    s_q99 = np.asarray(st["q99"], dtype=np.float32).reshape(-1)
+    a_q01 = np.asarray(ac["q01"], dtype=np.float32).reshape(-1)
+    a_q99 = np.asarray(ac["q99"], dtype=np.float32).reshape(-1)
+    n = min(s_q01.size, a_q01.size)
+    span = np.maximum(s_q99[:n] - s_q01[:n], 1e-6)
+    same = (np.abs(s_q01[:n] - a_q01[:n]) / span < 0.05) & (
+        np.abs(s_q99[:n] - a_q99[:n]) / span < 0.05
+    )
+    if np.all(same):
+        return None
+    return ~same
 
 
 # ---------------------------------------------------------------------------
@@ -383,9 +422,14 @@ def build_gr00t_normalizers(
     blob = load_stats_blob(stats_json)
     key = resolve_embodiment(blob, arch, embodiment)
     if arch == "gr00t_n1_7":
-        rel: dict[str, Any] = {}
+        rel: dict[str, Any] = dict(blob[key].get("relative_action") or {})
         if rel_stats_json is not None:
-            rel = load_stats_blob(rel_stats_json)
+            loaded_rel = load_stats_blob(rel_stats_json)
+            if key in loaded_rel and isinstance(loaded_rel[key], dict):
+                loaded_rel = loaded_rel[key].get("relative_action", loaded_rel[key])
+            elif "relative_action" in loaded_rel and isinstance(loaded_rel["relative_action"], dict):
+                loaded_rel = loaded_rel["relative_action"]
+            rel = loaded_rel
         return _gr00t_n17(blob, key, rel)
     if arch == "gr00t_n1_6":
         return _gr00t_n16(blob, key)

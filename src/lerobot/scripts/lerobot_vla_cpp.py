@@ -116,10 +116,15 @@ class ReplayConfig:
     """Hardware-free check: feed recorded frames to the server instead of a robot."""
 
     repo_id: str | None = field(default=None, metadata={"help": "Dataset to replay observations from"})
+    dataset: str | None = field(default=None, metadata={"help": "Alias for repo_id"})
     revision: str | None = field(default=None, metadata={"help": "Dataset revision (default: main)"})
     episode: int = field(default=0, metadata={"help": "Episode to replay"})
     steps: int = field(default=10, metadata={"help": "Number of observations to send"})
-    stride: int = field(default=10, metadata={"help": "Dataset frames to skip between observations"})
+    stride: int = field(default=1, metadata={"help": "Dataset frames to skip between observations"})
+
+    def __post_init__(self):
+        if self.repo_id is None and self.dataset is not None:
+            self.repo_id = self.dataset
 
 
 @dataclass
@@ -516,81 +521,163 @@ def _async_loop(cfg, robot, client: VlaCppClient, joint_keys, camera_keys) -> in
         return engine.queries
 
 
+def _dataset_camera_keys(features: dict) -> list[str]:
+    """RGB camera keys from a dataset's features, with main/top cameras before wrist."""
+    keys = [
+        k
+        for k, ft in features.items()
+        if ft.get("dtype") in ("image", "video") and not k.endswith("_depth")
+    ]
+    return sorted(keys, key=lambda k: "wrist" in k)
+
+
+def _dataset_observation(
+    cfg: VlaCppClientConfig,
+    client: VlaCppClient,
+    item: dict,
+    camera_keys: list[str],
+) -> dict:
+    """Build a policy observation dict from one dataset item."""
+    observation: dict = {"task": cfg.task or item.get("task", "")}
+    if cfg.arch in MODALITY_KEYED_ARCHS:
+        keys, dims = (
+            (client.gr00t.state_keys, client.gr00t.state_dims)
+            if client.gr00t is not None
+            else ((), ())
+        )
+        if not keys:
+            raise SystemExit(f"--arch={cfg.arch} needs --stats_json")
+        flat = item[OBS_STATE].numpy().astype(np.float32)
+        observation.update(split_state_by_layout(flat, keys, dims))
+        for target, key in zip(("video.image", "video.wrist_image"), camera_keys, strict=False):
+            chw = item[key].numpy()
+            observation[target] = np.round(chw.transpose(1, 2, 0) * 255.0).astype(np.uint8)
+    else:
+        observation[OBS_STATE] = item[OBS_STATE].numpy().astype(np.float32)
+        for key in camera_keys:
+            observation[key] = item[key].numpy().astype(np.float32)
+    return observation
+
+
 def run_replay(cfg: VlaCppClientConfig) -> None:
     """Send recorded observations to the server and report what comes back."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    logging.info("Loading %s to replay observations", cfg.replay.repo_id)
-    dataset = LeRobotDataset(cfg.replay.repo_id, revision=cfg.replay.revision or "main")
-    camera_keys = [k for k, ft in dataset.meta.features.items() if ft["dtype"] in ("image", "video")]
+    logging.info("Loading %s to replay observations (mode=%s)", cfg.replay.repo_id, cfg.mode)
+    dataset = LeRobotDataset(
+        cfg.replay.repo_id,
+        revision=cfg.replay.revision or "main",
+        episodes=[cfg.replay.episode],
+    )
+    camera_keys = _dataset_camera_keys(dataset.meta.features)
     logging.info("%d frames, cameras %s", dataset.num_frames, camera_keys)
 
-    if cfg.replay.episode >= dataset.num_episodes:
-        raise SystemExit(f"episode {cfg.replay.episode} not in a dataset with {dataset.num_episodes}")
+    if cfg.replay.episode >= dataset.meta.total_episodes:
+        raise SystemExit(
+            f"episode {cfg.replay.episode} not in a dataset with {dataset.meta.total_episodes}"
+        )
     episode = dataset.meta.episodes[cfg.replay.episode]
     ep_from, ep_to = int(episode["dataset_from_index"]), int(episode["dataset_to_index"])
+    abs_to_rel = dataset.reader.absolute_to_relative_idx if dataset.reader is not None else None
 
     action_dim = cfg.action_dim or int(dataset.meta.features["action"]["shape"][0])
     client = build_client(cfg, tuple(camera_keys), action_dim)
 
     latencies, errors = [], []
+    preds, recs = [], []
     try:
-        for step in range(cfg.replay.steps):
-            index = ep_from + step * cfg.replay.stride
-            if index >= ep_to:
-                logging.info("reached the end of the episode")
-                break
-            item = dataset[index]
+        if cfg.mode == "async":
+            with build_async_client(cfg, client) as engine:
+                for step in range(cfg.replay.steps):
+                    index = ep_from + step * cfg.replay.stride
+                    if index >= ep_to:
+                        logging.info("reached the end of the episode")
+                        break
+                    rel_idx = abs_to_rel[index] if abs_to_rel is not None else index
+                    item = dataset[rel_idx]
+                    observation = _dataset_observation(cfg, client, item, camera_keys)
 
-            observation: dict = {"task": cfg.task or item.get("task", "")}
-            if cfg.arch in MODALITY_KEYED_ARCHS:
-                keys, dims = (
-                    (client.gr00t.state_keys, client.gr00t.state_dims)
-                    if client.gr00t is not None
-                    else ((), ())
+                    elapsed = 0.0
+                    if engine.ready_to_send() or engine.qsize == 0:
+                        engine.offer(observation)
+                        while engine.in_flight:
+                            time.sleep(0.002)
+                        if engine.failed:
+                            raise SystemExit(f"inference worker gave up: {engine.failure}")
+                        elapsed = engine.last_latency_ms
+                        latencies.append(elapsed)
+
+                    predicted = engine.pop_action()
+                    if predicted is None:
+                        raise SystemExit("action queue empty after query")
+                    predicted = predicted[:action_dim]
+                    for _ in range(cfg.replay.stride - 1):
+                        if engine.qsize > 0:
+                            engine.pop_action()
+
+                    recorded = item["action"].numpy()[:action_dim]
+                    preds.append(predicted)
+                    recs.append(recorded)
+                    errors.append(float(np.abs(predicted - recorded).max()))
+                    logging.info(
+                        "frame %5d | async q=%2d | %6.1f ms | pred=%s | recorded=%s",
+                        index,
+                        engine.qsize,
+                        elapsed,
+                        np.round(predicted, 2).tolist(),
+                        np.round(recorded, 2).tolist(),
+                    )
+        else:
+            for step in range(cfg.replay.steps):
+                index = ep_from + step * cfg.replay.stride
+                if index >= ep_to:
+                    logging.info("reached the end of the episode")
+                    break
+                rel_idx = abs_to_rel[index] if abs_to_rel is not None else index
+                item = dataset[rel_idx]
+                observation = _dataset_observation(cfg, client, item, camera_keys)
+
+                will_query = client.pending == 0
+                started = time.perf_counter()
+                predicted = client.get_action(observation)[:action_dim]
+                elapsed = (time.perf_counter() - started) * 1000 if will_query else 0.0
+                if will_query:
+                    latencies.append(elapsed)
+                for _ in range(cfg.replay.stride - 1):
+                    if client.pending:
+                        client._queue.popleft()
+
+                recorded = item["action"].numpy()[:action_dim]
+                preds.append(predicted)
+                recs.append(recorded)
+                errors.append(float(np.abs(predicted - recorded).max()))
+                logging.info(
+                    "frame %5d | sync q=%2d | %6.1f ms | pred=%s | recorded=%s",
+                    index,
+                    client.pending,
+                    elapsed,
+                    np.round(predicted, 2).tolist(),
+                    np.round(recorded, 2).tolist(),
                 )
-                if not keys:
-                    raise SystemExit(f"--arch={cfg.arch} needs --stats_json")
-                flat = item[OBS_STATE].numpy().astype(np.float32)
-                observation.update(split_state_by_layout(flat, keys, dims))
-                for target, key in zip(("video.image", "video.wrist_image"), camera_keys, strict=False):
-                    chw = item[key].numpy()
-                    observation[target] = np.round(chw.transpose(1, 2, 0) * 255.0).astype(np.uint8)
-            else:
-                observation[OBS_STATE] = item[OBS_STATE].numpy().astype(np.float32)
-                for key in camera_keys:
-                    observation[key] = item[key].numpy().astype(np.float32)
-
-            started = time.perf_counter()
-            chunk = client.predict_chunk(observation)
-            elapsed = (time.perf_counter() - started) * 1000
-            latencies.append(elapsed)
-
-            predicted = chunk[0, :action_dim]
-            recorded = item["action"].numpy()[:action_dim]
-            errors.append(float(np.abs(predicted - recorded).max()))
-            logging.info(
-                "frame %5d | %3d x %d chunk | %6.1f ms | a[0]=%s | recorded=%s",
-                index,
-                chunk.shape[0],
-                chunk.shape[1],
-                elapsed,
-                np.round(predicted, 2).tolist(),
-                np.round(recorded, 2).tolist(),
-            )
     finally:
         client.close()
 
     if not latencies:
         raise SystemExit("no actions received -- is the server serving the arch you asked for?")
     lat = np.array(latencies)
+    pred_arr = np.asarray(preds, dtype=np.float32)
+    rec_arr = np.asarray(recs, dtype=np.float32)
+    mae_per_joint = np.mean(np.abs(pred_arr - rec_arr), axis=0)
     logging.info(
-        "%d round trips | median %.1f ms, min %.1f, max %.1f | median |predicted - recorded| %.2f",
+        "%d round trips | median %.1f ms, min %.1f, max %.1f | median max-err %.2f | "
+        "per-joint MAE %s (mean %.2f)",
         len(lat),
         np.median(lat),
         lat.min(),
         lat.max(),
         np.median(errors),
+        np.round(mae_per_joint, 2).tolist(),
+        float(np.mean(mae_per_joint)),
     )
     logging.info(
         "Note: the recorded action is the teleoperator's, not ground truth for this "
