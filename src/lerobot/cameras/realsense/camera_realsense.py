@@ -205,9 +205,23 @@ class RealSenseCamera(Camera):
         try:
             rs_profile = rs_pipeline.start(rs_config)
         except RuntimeError as e:
-            raise ConnectionError(
-                f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
-            ) from e
+            if self.capture_width == 640 and self.capture_height == 360 and not self.use_depth:
+                logger.warning(
+                    f"{self} 640x360@{self.fps} unavailable on USB 2.0; falling back to 640x480@{self.fps} with 16:9 crop to 640x360."
+                )
+                rs_config = rs.config()
+                rs_config.enable_device(self.serial_number)
+                rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.rgb8, self.fps or 30)
+                try:
+                    rs_profile = rs_pipeline.start(rs_config)
+                except RuntimeError as e2:
+                    raise ConnectionError(
+                        f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
+                    ) from e2
+            else:
+                raise ConnectionError(
+                    f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
+                ) from e
 
         self.rs_pipeline = rs_pipeline
         self.rs_profile = rs_profile
@@ -649,6 +663,9 @@ class RealSenseCamera(Camera):
 
             if c != 3:
                 raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
+            if h == 480 and w == 640 and self.capture_height == 360 and self.capture_width == 640:
+                image = np.ascontiguousarray(cv2.resize(image, (640, 360), interpolation=cv2.INTER_AREA))
+                h, w, c = image.shape
 
         if h != self.capture_height or w != self.capture_width:
             raise RuntimeError(
