@@ -66,7 +66,7 @@ from .preprocessing import (
     gr00t_n16_image_transform,
     resize_with_pad,
 )
-from .stats import Gr00tNormalizers, build_gr00t_normalizers, pi05_state_quantiles
+from .stats import Gr00tNormalizers, build_gr00t_normalizers, pi05_delta_mask, pi05_state_quantiles
 
 DEFAULT_ADDRESS = "tcp://localhost:5555"
 DEFAULT_RECV_TIMEOUT_MS = 30_000
@@ -186,6 +186,7 @@ class VlaCppClient:
 
         self._pi05_q01: np.ndarray | None = None
         self._pi05_q99: np.ndarray | None = None
+        self._pi05_delta_mask: np.ndarray | None = None
         if arch == "pi05":
             if stats_json is None:
                 raise ValueError(
@@ -193,9 +194,11 @@ class VlaCppClient:
                     "quantiles: pass stats_json (a LeRobot meta/stats.json)."
                 )
             self._pi05_q01, self._pi05_q99 = pi05_state_quantiles(stats_json)
+            self._pi05_delta_mask = pi05_delta_mask(stats_json)
             logging.info(
-                "vla.cpp[pi05]: state quantiles (%d-D) from %s",
+                "vla.cpp[pi05]: state quantiles (%d-D, delta_mask=%s) from %s",
                 self._pi05_q01.size,
+                self._pi05_delta_mask.tolist() if self._pi05_delta_mask is not None else None,
                 stats_json,
             )
 
@@ -228,11 +231,24 @@ class VlaCppClient:
         require_package("transformers", extra="vla-cpp")
         from transformers import AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(
-            name,
-            trust_remote_code=bool(preset.get("trust_remote_code", False)),
-            use_fast=bool(preset.get("use_fast_tokenizer", True)),
-        )
+        fallbacks = {
+            "nvidia/Cosmos-Reason2-2B": "Qwen/Qwen3-VL-2B-Instruct",
+            "google/paligemma-3b-pt-224": "unsloth/gemma-2b",
+        }
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                name,
+                trust_remote_code=bool(preset.get("trust_remote_code", False)),
+                use_fast=bool(preset.get("use_fast_tokenizer", True)),
+            )
+        except OSError:
+            if name not in fallbacks:
+                raise
+            tok = AutoTokenizer.from_pretrained(
+                fallbacks[name],
+                trust_remote_code=bool(preset.get("trust_remote_code", False)),
+                use_fast=bool(preset.get("use_fast_tokenizer", True)),
+            )
         if arch == "gr00t_n1_6":
             # N1.6's chat template is not in tokenizer_config.json; it sits beside
             # the processor. Without it apply_chat_template emits a default that
@@ -451,7 +467,13 @@ class VlaCppClient:
         req.lang_tokens.extend(int(t) for t in self._tokenize(prompt))
         req.state.extend([0.0] * self.max_state_dim)
         self._maybe_pin_noise(req)
-        return self._send(req)
+        chunk = self._send(req)
+        if self._pi05_delta_mask is not None:
+            chunk = chunk.copy()
+            n_cols = min(chunk.shape[1], self._pi05_delta_mask.size, state.size)
+            cols = np.flatnonzero(self._pi05_delta_mask[:n_cols])
+            chunk[:, cols] += state[cols]
+        return chunk
 
     # -- GR00T --------------------------------------------------------------
 

@@ -178,6 +178,7 @@ class AsyncVlaCppClient:
             raise ValueError(f"fps must be positive, got {fps}")
         self.client = client
         self.actions_per_chunk = actions_per_chunk
+        self._effective_chunk_size = actions_per_chunk
         self.chunk_size_threshold = chunk_size_threshold
         self.aggregate_fn = (
             get_aggregate_function(aggregate_fn) if isinstance(aggregate_fn, str) else aggregate_fn
@@ -224,6 +225,7 @@ class AsyncVlaCppClient:
         """Drop queued actions and any offered observation. Call between episodes."""
         with self._cv:
             self._pending = None
+            self._effective_chunk_size = self.actions_per_chunk
         self.queue.clear()
 
     def __enter__(self) -> AsyncVlaCppClient:
@@ -252,7 +254,7 @@ class AsyncVlaCppClient:
         with self._cv:
             if self._in_flight or self._pending is not None or self._stop or self.failed:
                 return False
-        return len(self.queue) <= self.actions_per_chunk * self.chunk_size_threshold
+        return len(self.queue) <= self._effective_chunk_size * self.chunk_size_threshold
 
     def offer(self, observation: dict[str, Any]) -> bool:
         """Hand the worker an observation, stamped with the last executed timestep.
@@ -311,6 +313,8 @@ class AsyncVlaCppClient:
     def _query(self, timestep: int, observation: dict[str, Any]) -> None:
         started = time.perf_counter()
         chunk = self.client.predict_chunk(observation)[: self.actions_per_chunk, : self.client.action_dim]
+        if len(chunk) > 0:
+            self._effective_chunk_size = len(chunk)
         latency = time.perf_counter() - started
         dropped, blended, appended = self.queue.merge(timestep, chunk)
 
